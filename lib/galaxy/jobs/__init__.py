@@ -1379,7 +1379,15 @@ class MinimalJobWrapper(HasResourceParameters):
                 util.umask_fix_perms(path, self.app.config.umask, 0o666, self.app.config.gid)
 
     def fail(
-        self, message, exception=False, tool_stdout="", tool_stderr="", exit_code=None, job_stdout=None, job_stderr=None
+        self,
+        message,
+        exception=False,
+        tool_stdout="",
+        tool_stderr="",
+        exit_code=None,
+        job_stdout=None,
+        job_stderr=None,
+        job_metrics_directory=None,
     ):
         """
         Indicate job failure by setting state and message on all output
@@ -1405,6 +1413,10 @@ class MinimalJobWrapper(HasResourceParameters):
         # Might be AssertionError or other exception
         message = str(message)
         working_directory_exists = self.working_directory_exists()
+
+        if not job.tasks:
+            # If job was composed of tasks, don't attempt to recollect statistics
+            self._collect_metrics(job, job_metrics_directory)
 
         # if the job was deleted, don't fail it
         if not job.state == job.states.DELETED:
@@ -1481,6 +1493,7 @@ class MinimalJobWrapper(HasResourceParameters):
             pjaa.post_job_action for pjaa in job.post_job_actions if pjaa.post_job_action.action_type == "EmailAction"
         ]:
             ActionBox.execute(self.app, self.sa_session, pja, job)
+
         # If the job was deleted, call tool specific fail actions (used for e.g. external metadata) and clean up
         if self.tool:
             try:
@@ -1841,6 +1854,7 @@ class MinimalJobWrapper(HasResourceParameters):
                 job_stdout=job_stdout,
                 job_stderr=job_stderr,
                 exception=exception,
+                job_metrics_directory=job_metrics_directory,
             )
 
         # TODO: After failing here, consider returning from the function.
@@ -2005,13 +2019,13 @@ class MinimalJobWrapper(HasResourceParameters):
         # Once datasets are collected, set the total dataset size (includes extra files)
         for dataset_assoc in job.output_datasets:
             dataset = dataset_assoc.dataset.dataset
-            if not dataset.purged:
-                # assume all datasets in a job get written to the same objectstore
-                quota_source_info = dataset.quota_source_info
-                collected_bytes += dataset.set_total_size()
-            else:
+            # assume all datasets in a job get written to the same objectstore
+            quota_source_info = dataset.quota_source_info
+            collected_bytes += dataset.set_total_size()
+            if dataset.purged:
                 # Purge, in case job wrote directly to object store
                 dataset.full_delete()
+                collected_bytes = 0
 
         user = job.user
         if user and collected_bytes > 0 and quota_source_info is not None and quota_source_info.use:
@@ -2020,8 +2034,9 @@ class MinimalJobWrapper(HasResourceParameters):
         # Certain tools require tasks to be completed after job execution
         # ( this used to be performed in the "exec_after_process" hook, but hooks are deprecated ).
         param_dict = self.get_param_dict(job)
+        task_wrapper = None
         try:
-            self.tool.exec_after_process(
+            task_wrapper = self.tool.exec_after_process(
                 self.app, inp_data, out_data, param_dict, job=job, final_job_state=final_job_state
             )
         except Exception as e:
@@ -2063,6 +2078,10 @@ class MinimalJobWrapper(HasResourceParameters):
             self.sa_session.commit()
         if job.state == job.states.ERROR:
             self._report_error()
+        elif task_wrapper:
+            # Only task is setting metadata (if necessary) on expression tool output.
+            # The dataset state is SETTING_METADATA, which delays dependent jobs until the task completes.
+            task_wrapper.delay()
         cleanup_job = self.cleanup_job
         delete_files = cleanup_job == "always" or (job.state == job.states.OK and cleanup_job == "onsuccess")
         self.cleanup(delete_files=delete_files)
@@ -2138,7 +2157,13 @@ class MinimalJobWrapper(HasResourceParameters):
 
     def _collect_metrics(self, has_metrics, job_metrics_directory=None):
         job = has_metrics.get_job()
-        job_metrics_directory = job_metrics_directory or self.working_directory
+        if job_metrics_directory is None:
+            try:
+                # working directory might have been purged already
+                job_metrics_directory = self.working_directory
+            except Exception:
+                log.exception("Could not recover job metrics")
+                return
         per_plugin_properties = self.app.job_metrics.collect_properties(
             job.destination_id, self.job_id, job_metrics_directory
         )

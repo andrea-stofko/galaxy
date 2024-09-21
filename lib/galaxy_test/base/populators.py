@@ -1009,14 +1009,17 @@ class BaseDatasetPopulator(BasePopulator):
         assert isinstance(transform, list)
         return {t["action"] for t in transform}
 
-    def get_history_dataset_details(self, history_id: str, **kwds) -> Dict[str, Any]:
+    def get_history_dataset_details(self, history_id: str, keys: Optional[str] = None, **kwds) -> Dict[str, Any]:
         dataset_id = self.__history_content_id(history_id, **kwds)
-        details_response = self.get_history_dataset_details_raw(history_id, dataset_id)
+        details_response = self.get_history_dataset_details_raw(history_id, dataset_id, keys=keys)
         details_response.raise_for_status()
         return details_response.json()
 
-    def get_history_dataset_details_raw(self, history_id: str, dataset_id: str) -> Response:
-        details_response = self._get_contents_request(history_id, f"/datasets/{dataset_id}")
+    def get_history_dataset_details_raw(self, history_id: str, dataset_id: str, keys: Optional[str] = None) -> Response:
+        data = None
+        if keys:
+            data = {"keys": keys}
+        details_response = self._get_contents_request(history_id, f"/datasets/{dataset_id}", data=data)
         return details_response
 
     def get_history_dataset_extra_files(self, history_id: str, **kwds) -> list:
@@ -1770,7 +1773,11 @@ class BaseWorkflowPopulator(BasePopulator):
         return workflow_id
 
     def wait_for_invocation(
-        self, workflow_id: str, invocation_id: str, timeout: timeout_type = DEFAULT_TIMEOUT, assert_ok: bool = True
+        self,
+        workflow_id: Optional[str],
+        invocation_id: str,
+        timeout: timeout_type = DEFAULT_TIMEOUT,
+        assert_ok: bool = True,
     ) -> str:
         url = f"invocations/{invocation_id}"
 
@@ -1818,7 +1825,7 @@ class BaseWorkflowPopulator(BasePopulator):
 
     def wait_for_workflow(
         self,
-        workflow_id: str,
+        workflow_id: Optional[str],
         invocation_id: str,
         history_id: str,
         assert_ok: bool = True,
@@ -1827,6 +1834,9 @@ class BaseWorkflowPopulator(BasePopulator):
         """Wait for a workflow invocation to completely schedule and then history
         to be complete."""
         self.wait_for_invocation(workflow_id, invocation_id, timeout=timeout, assert_ok=assert_ok)
+        for step in self.get_invocation(invocation_id)["steps"]:
+            if step["subworkflow_invocation_id"]:
+                self.wait_for_invocation(None, step["subworkflow_invocation_id"], timeout=timeout, assert_ok=assert_ok)
         self.dataset_populator.wait_for_history_jobs(history_id, assert_ok=assert_ok, timeout=timeout)
 
     def get_invocation(self, invocation_id, step_details=False):

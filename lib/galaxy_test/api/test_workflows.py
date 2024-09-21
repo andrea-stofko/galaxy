@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import shutil
@@ -885,6 +886,43 @@ class TestWorkflowsApi(BaseWorkflowsApiTestCase, ChangeDatatypeTests):
         assert update_response["name"] == "my cool new name"
         workflow_dict = self.workflow_populator.download_workflow(workflow_id)
         assert workflow_dict["license"] == "AAL"
+
+    def test_update_name_for_workflow_with_subworkflows(self):
+        workflow_id = self.workflow_populator.upload_yaml_workflow(
+            """
+class: GalaxyWorkflow
+label: old name
+inputs:
+  dataset: data
+steps:
+  subworkflow:
+    in:
+      dataset: dataset
+    outputs:
+      output:
+        outputSource: cat1/out_file1
+    run:
+      class: GalaxyWorkflow
+      inputs:
+        dataset:
+          type: data
+      steps:
+        cat1:
+          tool_id: cat1
+          in:
+            input1: dataset
+  cat1:
+    tool_id: cat1
+    in:
+      input1: subworkflow/output
+"""
+        )
+        self.workflow_populator.download_workflow(workflow_id)
+        new_name = "my cool new name"
+        data = {"name": new_name}
+        self._update_workflow(workflow_id, data).raise_for_status()
+        post_update_workflow = self.workflow_populator.download_workflow(workflow_id)
+        assert post_update_workflow["name"] == new_name
 
     def test_update_name_empty(self):
         # Update doesn't allow empty names.
@@ -2086,14 +2124,25 @@ steps:
           pick_from:
           - value:
             __class__: RuntimeValue
+  consume_index:
+    tool_id: metadata_bam
+    in:
+      input_bam: pick_value/data_param
+    tool_state:
+      ref_names:
+        - chr10_random
+        - chr11
+        - chrM
+        - chrX
+        - chr16
 outputs:
   pick_out:
     outputSource: pick_value/data_param
 """,
                 test_data="""
 some_file:
-  value: 1.bam
-  file_type: bam
+  value: 3.bam
+  file_type: unsorted.bam
   type: File
 """,
                 history_id=history_id,
@@ -2106,6 +2155,7 @@ some_file:
         )
         assert dataset_details["metadata_reference_names"]
         assert dataset_details["metadata_bam_index"]
+        assert dataset_details["file_ext"] == "bam"
 
     def test_run_workflow_simple_conditional_step(self):
         with self.dataset_populator.test_history() as history_id:
@@ -2441,6 +2491,30 @@ when:
             for step in invocation_details["steps"]:
                 if step["workflow_step_label"] == "cat1":
                     assert sum(1 for j in step["jobs"] if j["state"] == "skipped") == 1
+
+    def test_run_workflow_conditional_subworkflow_step_with_hdca_creation(self):
+        # Regression test, ensures scheduling proceeds even if a skipped step creates a collection
+        with self.dataset_populator.test_history() as history_id:
+            self._run_workflow(
+                """
+class: GalaxyWorkflow
+inputs: []
+steps:
+  conditional_subworkflow_step:
+    when: $(false)
+    run:
+      class: GalaxyWorkflow
+      inputs: []
+      steps:
+        create_collection:
+          tool_id: create_input_collection
+        flatten_collection:
+          tool_id: cat_list
+          in:
+            input1: create_collection/output
+                           """,
+                history_id=history_id,
+            )
 
     def test_run_workflow_conditional_step_map_over_expression_tool(self):
         with self.dataset_populator.test_history() as history_id:
@@ -7438,6 +7512,84 @@ steps: []
 
         assert invocation_steps[1]["state"] == "ok"
 
+    def test_data_input_recovery_on_delayed_input(self):
+        self.workflow_populator.run_workflow(
+            """
+class: GalaxyWorkflow
+inputs: {}
+outputs:
+  the_output:
+    outputSource: child/output
+steps:
+  running_output:
+    tool_id: job_properties
+    tool_state:
+      failbool: false
+      sleepsecs: 3
+      thebool: false
+  child:
+    in:
+      input_dataset:
+        source: running_output/out_file1
+    run:
+      class: GalaxyWorkflow
+      inputs:
+        input_dataset: data
+        run_step:
+          default: false
+          optional: true
+          type: boolean
+      outputs:
+        output:
+          outputSource: conditional_cat/out_file1
+      steps:
+        conditional_cat:
+          tool_id: cat
+          when: $(inputs.when)
+          in:
+            input1: input_dataset
+            when:
+              source: run_step"""
+        )
+
+    def test_subworkflow_output_not_found_fails(self):
+        # This test might start failing if we ever validate connections before attempting to schedule
+        summary = self.workflow_populator.run_workflow(
+            """
+class: GalaxyWorkflow
+inputs:
+  input: data
+outputs:
+  the_output:
+    outputSource: child/output
+steps:
+  child:
+    in:
+      input_dataset:
+        source: input
+    run:
+      class: GalaxyWorkflow
+      inputs:
+        input_dataset: data
+      outputs:
+        output:
+          outputSource: cat/out_file_that_doesnt_exist
+      steps:
+        cat:
+          tool_id: cat
+          in:
+            input1: input_dataset
+test_data:
+  input:
+    value: 1.fasta
+    type: File
+            """,
+            assert_ok=False,
+        )
+        invocation = self.workflow_populator.get_invocation(summary.invocation_id)
+        assert invocation["state"] == "failed"
+        assert invocation["messages"][0]["reason"] == "output_not_found"
+
     def _run_mapping_workflow(self):
         history_id = self.dataset_populator.new_history()
         summary = self._run_workflow(
@@ -7739,6 +7891,11 @@ outer_input:
         downloaded_workflow = self._download_workflow(workflow_id)
         subworkflow = downloaded_workflow["steps"]["1"]["subworkflow"]
         assert subworkflow["tags"] == []
+
+    def test_upload_malformated_yaml(self):
+        malformated_yaml = "class: GalaxyWorkflow:\n    a-1:()"
+        r = self._post("workflows", files={"archive_file": io.StringIO(malformated_yaml)})
+        assert r.status_code == 400
 
 
 class TestAdminWorkflowsApi(BaseWorkflowsApiTestCase):
